@@ -17,7 +17,6 @@ incremental = false
 clap = { version = "4.5.38", features = ["derive"] }
 ctrlc = "3.4.6"
 ffmpeg-next = "7.1.0"
-gphoto2 = "3.4.1"
-image = "0.25.6"
+gphoto2 = { git = "https://github.com/cowtoolz/gphoto2-rs-movie" }
 num_cpus = "1.16.0"
 v4l = "0.14.0"
