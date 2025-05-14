@@ -1,0 +1,5 @@
+we might need to make sure user is in video group:
+
+```
+$ sudo usermod -a -G video $USER
+```

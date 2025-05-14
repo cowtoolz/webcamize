@@ -3,58 +3,153 @@ use ffmpeg_next::codec::packet::Packet;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::frame::Video;
 use ffmpeg_next::software::scaling::{context::Context, flag::Flags};
-use ffmpeg_next::util::format::pixel::Pixel as PixelFormat;
-use gphoto2::camera::CameraEvent;
-use gphoto2::widget::{RadioWidget, TextWidget, ToggleWidget, WidgetBase};
 use gphoto2::Context as GPhotoContext;
+use interprocess::local_socket::traits::ListenerExt;
+use interprocess::local_socket::{self, GenericNamespaced, Stream, ToNsName};
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{io, thread};
 
-mod canon;
+mod v4l2loopbackctl;
 
 const TARGET_FPS: i32 = 60;
 const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS as u64);
 
+#[derive(Clone)]
+struct ActiveCamera {
+    name: String,
+    port: String,
+    device_number: usize,
+    stop_handle: Arc<AtomicBool>,
+}
+
+impl ActiveCamera {
+    fn stop(&self) {
+        self.stop_handle.store(false, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize FFmpeg
+    let alive = Arc::new(AtomicBool::new(true));
+    let ctrl_c_alive = alive.clone();
+    ctrlc::set_handler(move || {
+        ctrl_c_alive.store(false, Ordering::SeqCst);
+    })
+    .unwrap();
+
+    // the daemon should always be running with root privs
     ffmpeg::init()?;
     ffmpeg::log::set_level(ffmpeg::log::Level::Verbose);
 
-    // Initialize gphoto2
-    let context = GPhotoContext::new()?;
-    let camera = context.autodetect_camera().wait()?;
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Set up Ctrl+C handler
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
+    let mut active_cameras = vec![];
+    // ensure v4l2loopback module is loaded
+
+    // start a camera
+    let acam = Arc::new(ActiveCamera {
+        name: "todo".to_string(),
+        port: "todo".to_string(),
+        stop_handle: Arc::new(AtomicBool::new(true)),
+        device_number: 10,
+    });
+    active_cameras.push(acam.clone());
+    rt.spawn(async move { start_camera(acam) });
+
+    // IPC handler below
+    let listener = local_socket::ListenerOptions::new()
+        .name("webcamize.sock".to_ns_name::<GenericNamespaced>()?)
+        .create_sync()
+        .unwrap();
+    fn handle_error(conn: std::io::Result<Stream>) -> Option<Stream> {
+        match conn {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("Incoming connection failed: {e}");
+                None
+            }
+        }
+    }
+
+    let mut buffer = String::with_capacity(4096);
+    while alive.load(Ordering::SeqCst) {
+        // disabled for now
+        while false {
+            //for conn in listener.incoming().filter_map(handle_error) {
+            // Wrap the connection into a buffered receiver right away
+            // so that we could receive a single line from it.
+
+            // remove these 2 lines
+            let dbg = vec![];
+            let conn = BufReader::new(dbg.as_slice());
+
+            let mut conn = BufReader::new(conn);
+            println!("Incoming connection!");
+
+            // read camera config object from socket
+            conn.read_line(&mut buffer)?;
+
+            // return an object with a status and message
+            //conn.get_mut().write_all(b"Hello from daemon!\n")?;
+
+            // Print out the result, getting the newline for free!
+            print!("Client answered: {buffer}");
+
+            // Clear the buffer so that the next iteration will display new data instead of messages
+            // stacking on top of one another.
+            buffer.clear();
+        }
+    }
+    println!("KILLING IN THE NAME OF CTRL+C!");
+
+    // close active cameras
+    active_cameras.iter().for_each(|cam| {
+        cam.stop();
+    });
+
+    Ok(())
+}
+
+fn start_camera(acam: Arc<ActiveCamera>) -> Result<(), Box<std::io::Error>> {
+    // Initialize gphoto2
+    let gphoto2_context = GPhotoContext::new().unwrap();
+    let camera = gphoto2_context.autodetect_camera().wait().unwrap();
+
+    //gphoto2_context.get_camera(&gphoto2::list::CameraDescriptor {
+    //    model: camera_model,
+    //    port: camera_port,
+    //});
 
     // Get one preview to determine format
     println!("Getting initial preview to determine format...");
-    let first_preview = camera.capture_preview().wait()?;
-    let first_data = first_preview.get_data(&context).wait()?;
+    let first_preview = camera.capture_preview().wait().unwrap();
+    let first_data = first_preview.get_data(&gphoto2_context).wait().unwrap();
 
     // Find a JPEG decoder
     let jpeg_decoder_codec = ffmpeg::decoder::find(ffmpeg::codec::Id::MJPEG)
-        .ok_or_else(|| ffmpeg::Error::DecoderNotFound)?;
+        .ok_or_else(|| ffmpeg::Error::DecoderNotFound)
+        .unwrap();
 
     let decoder_context = ffmpeg::codec::context::Context::new();
-    let decoder = decoder_context.decoder().open_as(jpeg_decoder_codec)?;
-    let mut video_decoder = decoder.video()?;
+    let decoder = decoder_context
+        .decoder()
+        .open_as(jpeg_decoder_codec)
+        .unwrap();
+    let mut video_decoder = decoder.video().unwrap();
 
     // Create a packet from the JPEG data
     let packet = Packet::copy(&first_data);
 
     // Send packet to decoder
-    video_decoder.send_packet(&packet)?;
+    video_decoder.send_packet(&packet).unwrap();
 
     // Get the decoded frame
     let mut decoded_frame = Video::empty();
-    video_decoder.receive_frame(&mut decoded_frame)?;
+    video_decoder.receive_frame(&mut decoded_frame).unwrap();
 
     // Get dimensions and format
     let width = decoded_frame.width();
@@ -65,21 +160,25 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
     println!("Source pixel format: {:?}", source_format);
 
     // Set up V4L2 output
-    let device_number = 9;
-    let output_path = format!("/dev/video{}", device_number);
+    //  let device_number = 7;
+    let output_path = format!("/dev/video{}", acam.device_number);
 
     // Create V4L2 output context
-    let mut octx = ffmpeg::format::output_as(&output_path, "v4l2")?;
+    let mut octx = ffmpeg::format::output_as(&output_path, "v4l2").unwrap();
 
     // Set up encoder for raw video (V4L2 loopback device)
-    let codec =
-        ffmpeg::encoder::find(ffmpeg::codec::Id::RAWVIDEO).ok_or(ffmpeg::Error::EncoderNotFound)?;
+    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::RAWVIDEO)
+        .ok_or(ffmpeg::Error::EncoderNotFound)
+        .unwrap();
 
-    let mut ost = octx.add_stream(codec)?;
-    let mut encoder = ffmpeg::codec::context::Context::new().encoder().video()?;
+    let mut ost = octx.add_stream(codec).unwrap();
+    let mut encoder = ffmpeg::codec::context::Context::new()
+        .encoder()
+        .video()
+        .unwrap();
 
     // Configure encoder - RGB24 is commonly supported by V4L2
-    let output_pixel_format = Pixel::YUV420P;
+    let output_pixel_format = Pixel::RGB24;
 
     encoder.set_format(output_pixel_format);
     encoder.set_width(width);
@@ -91,9 +190,9 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
         count: num_cpus::get(),
     });
 
-    let mut encoder = encoder.open_as(codec)?;
+    let mut encoder = encoder.open_as(codec).unwrap();
     ost.set_parameters(&encoder);
-    octx.write_header()?;
+    octx.write_header().unwrap();
 
     // Set up scaling context to convert from source format to RGB24
     let mut scaler = Context::get(
@@ -104,7 +203,8 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
         width,
         height,
         Flags::BILINEAR,
-    )?;
+    )
+    .unwrap();
 
     // Prepare output frame
     let mut output_frame = Video::new(output_pixel_format, width, height);
@@ -119,9 +219,10 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create decoder once instead of for each frame
     let jpeg_decoder_codec = ffmpeg::decoder::find(ffmpeg::codec::Id::MJPEG)
-        .ok_or_else(|| ffmpeg::Error::DecoderNotFound)?;
+        .ok_or_else(|| ffmpeg::Error::DecoderNotFound)
+        .unwrap();
 
-    while running.load(Ordering::SeqCst) {
+    while acam.stop_handle.load(Ordering::SeqCst) {
         // Capture preview from camera
         let preview = match camera.capture_preview().wait() {
             Ok(p) => p,
@@ -131,7 +232,7 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let data = match preview.get_data(&context).wait() {
+        let data = match preview.get_data(&gphoto2_context).wait() {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Error getting preview data: {}", e);
@@ -210,14 +311,14 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clean up
     println!("\nShutting down...");
-    encoder.send_eof()?;
+    encoder.send_eof().unwrap();
     let mut packet = ffmpeg::codec::packet::Packet::empty();
     while encoder.receive_packet(&mut packet).is_ok() {
         packet.set_stream(0);
-        packet.write_interleaved(&mut octx)?;
+        packet.write_interleaved(&mut octx).unwrap();
     }
 
-    octx.write_trailer()?;
+    octx.write_trailer().unwrap();
     println!("Stream stopped");
 
     Ok(())
