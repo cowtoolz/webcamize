@@ -5,17 +5,11 @@ edition = "2021"
 
 [profile.release]
 lto = "fat"
-codegen-units = 1
-opt-level = 3
-panic = "abort"
-strip = true
-overflow-checks = false
-debug = false
-incremental = false
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
 ctrlc = { version = "3.4.6", features = ["termination"] }
+egui = "0.31.1"
 ffmpeg-next = "7.1.0"
 gphoto2 = { git = "https://github.com/cowtoolz/gphoto2-rs-movie" }
 interprocess = "2.2.3"

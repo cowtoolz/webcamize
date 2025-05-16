@@ -6,9 +6,9 @@ use ffmpeg_next::software::scaling::{context::Context, flag::Flags};
 use gphoto2::Context as GPhotoContext;
 use interprocess::local_socket::traits::ListenerExt;
 use interprocess::local_socket::{self, GenericNamespaced, Stream, ToNsName};
-use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -24,12 +24,12 @@ struct ActiveCamera {
     name: String,
     port: String,
     device_number: usize,
-    stop_handle: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 impl ActiveCamera {
     fn stop(&self) {
-        self.stop_handle.store(false, Ordering::SeqCst);
+        self.alive.store(false, Ordering::SeqCst);
     }
 }
 
@@ -50,16 +50,6 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_cameras = vec![];
     // ensure v4l2loopback module is loaded
 
-    // start a camera
-    let acam = Arc::new(ActiveCamera {
-        name: "todo".to_string(),
-        port: "todo".to_string(),
-        stop_handle: Arc::new(AtomicBool::new(true)),
-        device_number: 10,
-    });
-    active_cameras.push(acam.clone());
-    rt.spawn(async move { start_camera(acam) });
-
     // IPC handler below
     let listener = local_socket::ListenerOptions::new()
         .name("webcamize.sock".to_ns_name::<GenericNamespaced>()?)
@@ -75,36 +65,38 @@ pub(crate) fn init() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut buffer = String::with_capacity(4096);
+    let mut buffer = Vec::with_capacity(512);
     while alive.load(Ordering::SeqCst) {
-        // disabled for now
-        while false {
-            //for conn in listener.incoming().filter_map(handle_error) {
-            // Wrap the connection into a buffered receiver right away
-            // so that we could receive a single line from it.
-
-            // remove these 2 lines
-            let dbg = vec![];
-            let conn = BufReader::new(dbg.as_slice());
-
+        for conn in listener.incoming().filter_map(handle_error) {
             let mut conn = BufReader::new(conn);
-            println!("Incoming connection!");
+            println!("Incoming connection...");
 
-            // read camera config object from socket
-            conn.read_line(&mut buffer)?;
+            conn.read_until(b'\0', &mut buffer).unwrap();
 
-            // return an object with a status and message
-            //conn.get_mut().write_all(b"Hello from daemon!\n")?;
+            buffer.pop(); // remove null terminator
 
-            // Print out the result, getting the newline for free!
-            print!("Client answered: {buffer}");
+            if buffer == b"status" {
+                conn.get_mut().write_all(b"    Hello from daemon!")?;
+            } else if buffer == b"start" {
+                // start a camera
+                let acam = Arc::new(ActiveCamera {
+                    name: "todo".to_string(),
+                    port: "todo".to_string(),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    device_number: 1,
+                });
+                active_cameras.push(acam.clone());
+                rt.spawn(async move { start_camera(acam) });
+                conn.get_mut().write_all(b"OK\0")?;
+            } else {
+                conn.get_mut().write_all(b"\0")?;
+            }
 
-            // Clear the buffer so that the next iteration will display new data instead of messages
-            // stacking on top of one another.
             buffer.clear();
         }
     }
-    println!("KILLING IN THE NAME OF CTRL+C!");
+
+    println!("Terminating!");
 
     // close active cameras
     active_cameras.iter().for_each(|cam| {
@@ -222,7 +214,7 @@ fn start_camera(acam: Arc<ActiveCamera>) -> Result<(), Box<std::io::Error>> {
         .ok_or_else(|| ffmpeg::Error::DecoderNotFound)
         .unwrap();
 
-    while acam.stop_handle.load(Ordering::SeqCst) {
+    while acam.alive.load(Ordering::SeqCst) {
         // Capture preview from camera
         let preview = match camera.capture_preview().wait() {
             Ok(p) => p,
