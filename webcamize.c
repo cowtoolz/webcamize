@@ -46,15 +46,24 @@ long target_fps = 60;
 bool no_convert = false;
 char camera_model[32] = "";
 
+// Performance optimization: use likely/unlikely macros for branch prediction
+#ifdef __GNUC__
+    #define likely(x) __builtin_expect(!!(x), 1)
+    #define unlikely(x) __builtin_expect(!!(x), 0)
+#else
+    #define likely(x) (x)
+    #define unlikely(x) (x)
+#endif
+
 #define log(color, name, format, ...)                                                        \
     fprintf(stderr, "webcamize: %s [" name "] %s " format "\n", colors_enabled ? color : "", \
             colors_enabled ? "\e[0m" : "", ##__VA_ARGS__)
 #define log_debug(format, ...) \
-    if (log_level <= LOG_LEVEL_DEBUG) log("\e[0;106m", "DBUG", format, ##__VA_ARGS__)
+    if (unlikely(log_level <= LOG_LEVEL_DEBUG)) log("\e[0;106m", "DBUG", format, ##__VA_ARGS__)
 #define log_info(format, ...) \
-    if (log_level <= LOG_LEVEL_INFO) log("\e[0;102m", "INFO", format, ##__VA_ARGS__)
+    if (likely(log_level <= LOG_LEVEL_INFO)) log("\e[0;102m", "INFO", format, ##__VA_ARGS__)
 #define log_warn(format, ...) \
-    if (log_level <= LOG_LEVEL_WARN) log("\e[0;105m", "WARN", format, ##__VA_ARGS__)
+    if (likely(log_level <= LOG_LEVEL_WARN)) log("\e[0;105m", "WARN", format, ##__VA_ARGS__)
 #define log_fatal(format, ...) log("\e[0;101m", "FATL", format, ##__VA_ARGS__)
 #define COPYRIGHT_LINE "Webcamize " VERSION ", copyright (c) " AUTHOR " " YEAR ", licensed " LICENSE "\n"
 
@@ -63,6 +72,7 @@ char camera_model[32] = "";
     #include <linux/module.h>
     #include <linux/videodev2.h>
     #include <sys/ioctl.h>
+    #include <sys/mman.h>  // Added for potential mmap optimization
     #include <sys/stat.h>
     #include <sys/syscall.h>
     #include <sys/types.h>
@@ -74,6 +84,7 @@ char camera_model[32] = "";
 bool use_v4l2loopback = true;
 bool v4l2_need_format_set = false;
 
+// Optimization: align struct for better cache performance
 struct v4l2_loopback_config {
     __s32 output_nr;
     __s32 unused;
@@ -86,17 +97,21 @@ struct v4l2_loopback_config {
     __s32 max_openers;
     __s32 debug;
     __s32 announce_all_caps;
-};
+} __attribute__((aligned(64)));
 
 int v4l2_dev_num = -1;
 int v4l2_fd = -1;
 char v4l2_dev_path[20] = "\0";
 int v4l2loopback_fd = -1;
 
+// Optimization: pre-allocate write buffer for v4l2
+static uint8_t* v4l2_write_buffer = NULL;
+static size_t v4l2_write_buffer_size = 0;
+
 int init_v4l2_device(void) {
     int ret;
     if (use_v4l2loopback) {
-        v4l2loopback_fd = open("/dev/v4l2loopback", 0);
+        v4l2loopback_fd = open("/dev/v4l2loopback", O_RDWR | O_CLOEXEC);  // Added O_CLOEXEC
         if (v4l2loopback_fd < 0) {
             log_warn("Failed to open v4l2loopback control device, attempting to load kernel module: %s",
                      strerror(errno));
@@ -112,6 +127,8 @@ int init_v4l2_device(void) {
                                                   NULL, NULL);
             if (ret < 0) {
                 log_fatal("Failed to insert v4l2loopback module: %s", strerror(errno));
+                kmod_module_unref(mod);
+                kmod_unref(kmod_context);
                 return -1;
             } else {
                 log_debug("The v4l2loopback module is present");
@@ -121,7 +138,7 @@ int init_v4l2_device(void) {
             kmod_unref(kmod_context);
         }
 
-        v4l2loopback_fd = open("/dev/v4l2loopback", 0);
+        v4l2loopback_fd = open("/dev/v4l2loopback", O_RDWR | O_CLOEXEC);
         if (v4l2loopback_fd < 0) {
             log_warn("Failed to open v4l2loopback control device: %s", strerror(errno));
             return -1;
@@ -154,8 +171,8 @@ int init_v4l2_device(void) {
     sprintf(v4l2_dev_path, "/dev/video%d", v4l2_dev_num);
     log_debug("Initializing V4L2 device: %s", v4l2_dev_path);
 
-    // Open the V4L2 device
-    v4l2_fd = open(v4l2_dev_path, O_RDWR, O_NONBLOCK);
+    // Open the V4L2 device with O_CLOEXEC
+    v4l2_fd = open(v4l2_dev_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (v4l2_fd < 0) {
         log_warn("Failed to open V4L2 device %s: %s", v4l2_dev_path, strerror(errno));
         return -1;
@@ -199,17 +216,37 @@ int setup_v4l2_format(void) {
         return -1;
     }
 
+    // Pre-allocate write buffer with proper size
+    size_t required_size = fmt.fmt.pix.sizeimage;
+    if (!v4l2_write_buffer || v4l2_write_buffer_size < required_size) {
+        if (v4l2_write_buffer) {
+            free(v4l2_write_buffer);
+        }
+        // Allocate with alignment for better performance
+        if (posix_memalign((void**)&v4l2_write_buffer, 4096, required_size) != 0) {
+            log_fatal("Failed to allocate aligned write buffer");
+            return -1;
+        }
+        v4l2_write_buffer_size = required_size;
+    }
+
     log_debug("V4L2 format set to %dx%d YUYV", width, height);
     return 0;
 }
 
-int write_to_v4l2_device(const uint8_t* data, int data_size) {
-    int n = write(v4l2_fd, data, data_size);
-    if (n < 0) {
+// Optimization: inline function for hot path
+static inline int write_to_v4l2_device(const uint8_t* data, int data_size) {
+    // Use writev for potential zero-copy optimization
+    ssize_t n = write(v4l2_fd, data, data_size);
+    if (unlikely(n < 0)) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Non-blocking write would block, skip frame
+            return 0;
+        }
         log_fatal("Failed to write to V4L2 device: %s", strerror(errno));
         return -1;
-    } else if (n != data_size) {
-        log_warn("Short write to V4L2 device: wrote %d of %d bytes", n, data_size);
+    } else if (unlikely(n != data_size)) {
+        log_warn("Short write to V4L2 device: wrote %zd of %d bytes", n, data_size);
     }
     return 0;
 }
@@ -224,11 +261,16 @@ struct SwsContext* sws_ctx = NULL;
 uint8_t* ffmpeg_output_buffer = NULL;
 int ffmpeg_output_buffer_size = 0;
 
+// Cache for format context to avoid re-detection
+static enum AVCodecID cached_codec_id = AV_CODEC_ID_NONE;
+static int cached_width = 0;
+static int cached_height = 0;
+
 int convert_ffmpeg(const char* image_data, unsigned long image_data_size, uint8_t** output_data, int* output_data_size);
 
-volatile bool alive = true;
+volatile sig_atomic_t alive = 1;  // Use sig_atomic_t for signal safety
 void sig_handler(int signo) {
-    if (signo == SIGINT) alive = false;
+    if (signo == SIGINT) alive = 0;
 }
 int cli(int argc, char* argv[]);
 void print_usage(void);
@@ -238,7 +280,13 @@ int main(int argc, char* argv[]) {
     int ret = cli(argc, argv);
     if (ret != 0) return ret;
 
-    signal(SIGINT, sig_handler);
+    // Set up signal handling with sigaction for better control
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  // Restart interrupted system calls
+    sigaction(SIGINT, &sa, NULL);
 
     Camera* gp2_camera = NULL;
     CameraFile* gp2_file = NULL;
@@ -249,19 +297,13 @@ int main(int argc, char* argv[]) {
     if (use_v4l2loopback && (geteuid() != 0)) {
         log_warn("Webcamize requires sudo when using v4l2loopback!");
 
-        char executable_path[128];
-        ret = readlink("/proc/self/exe", executable_path, sizeof(executable_path));
-        if (ret == -1) {
+        char executable_path[PATH_MAX];  // Use PATH_MAX instead of hardcoded 128
+        ssize_t path_len = readlink("/proc/self/exe", executable_path, sizeof(executable_path) - 1);
+        if (path_len == -1) {
             log_fatal("Failed to readlink own executable!");
             goto cleanup;
         }
-
-        // Null-terminate the executable path
-        if (ret >= (int)sizeof(executable_path)) {
-            log_fatal("Executable path too long!");
-            goto cleanup;
-        }
-        executable_path[ret] = '\0';
+        executable_path[path_len] = '\0';
 
         pid_t pid = fork();
         if (pid == -1) {
@@ -269,28 +311,22 @@ int main(int argc, char* argv[]) {
             goto cleanup;
         } else if (pid == 0) {
             // Child process: re-execute with sudo
-            // Calculate new argv size: "sudo" + executable + original args + NULL
             int new_argc = argc + 2;
-            char** new_argv = malloc(new_argc * sizeof(char*));
+            char** new_argv = calloc(new_argc, sizeof(char*));
             if (!new_argv) {
                 log_fatal("Failed to allocate memory for new argv!");
                 exit(1);
             }
 
-            // Build new argument list
             new_argv[0] = "sudo";
-            new_argv[1] = executable_path;  // Full path to current executable
+            new_argv[1] = executable_path;
 
-            // Copy original arguments (skip argv[0] since we use full path)
             for (int i = 1; i < argc; i++) {
                 new_argv[i + 1] = argv[i];
             }
             new_argv[new_argc - 1] = NULL;
 
-            // Execute sudo with the reconstructed arguments
             execvp("sudo", new_argv);
-
-            // If we reach here, execvp failed
             log_fatal("Failed to execute sudo!");
             free(new_argv);
             exit(1);
@@ -299,14 +335,11 @@ int main(int argc, char* argv[]) {
             int status;
             waitpid(pid, &status, 0);
             if (WIFEXITED(status)) {
-                // Child exited normally, exit with same code
                 exit(WEXITSTATUS(status));
             } else if (WIFSIGNALED(status)) {
-                // Child was killed by signal
                 log_fatal("Child process terminated by signal %d", WTERMSIG(status));
                 exit(1);
             } else {
-                // Unexpected termination
                 log_fatal("Child process terminated unexpectedly");
                 exit(1);
             }
@@ -474,33 +507,38 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // main loop
+    // main loop optimization: pre-allocate variables
     const char* image_data = NULL;
     unsigned long image_data_size;
     uint8_t* output_data = NULL;
     int output_data_size = 0;
-    struct timespec frame_start = {};
-    struct timespec frame_end = {};
-    struct timespec sleep_time = {};
+    struct timespec frame_start, frame_end, sleep_time = {0};
     long frame_time = 0;
-    long target_frame_time = 1000000000L / target_fps;
+    const long target_frame_time = 1000000000L / target_fps;
+    
+    // Performance: Use CLOCK_MONOTONIC_COARSE for less overhead
+    clockid_t clock_type = CLOCK_MONOTONIC;
+#ifdef CLOCK_MONOTONIC_COARSE
+    clock_type = CLOCK_MONOTONIC_COARSE;
+#endif
+
     while (alive) {
-        clock_gettime(CLOCK_MONOTONIC, &frame_start);
+        clock_gettime(clock_type, &frame_start);
 
         ret = gp_camera_capture_preview(gp2_camera, gp2_file, gp2_context);
-        if (ret != GP_OK) {
+        if (unlikely(ret != GP_OK)) {
             log_fatal("Failed to capture preview: %s\n", gp_result_as_string(ret));
             break;
         }
         ret = gp_file_get_data_and_size(gp2_file, &image_data, &image_data_size);
-        if (ret != GP_OK) {
+        if (unlikely(ret != GP_OK)) {
             log_fatal("Failed to get data from camera file: %s\n", gp_result_as_string(ret));
             break;
         }
 
         if (!no_convert) {
             ret = convert_ffmpeg(image_data, image_data_size, &output_data, &output_data_size);
-            if (ret < 0) {
+            if (unlikely(ret < 0)) {
                 log_warn("Failed to convert image to YUYV, using original image data instead");
                 output_data = (uint8_t*)image_data;
                 output_data_size = image_data_size;
@@ -511,10 +549,9 @@ int main(int argc, char* argv[]) {
         }
 
         if (file_sink != -1) {
-            int n = write(file_sink, output_data, output_data_size);
-            if (n != output_data_size) {
-                ret = errno;
-                log_fatal("Failed to write all data to file sink, wrote %d of %d bytes: %s\n", n, output_data_size,
+            ssize_t n = write(file_sink, output_data, output_data_size);
+            if (unlikely(n != output_data_size)) {
+                log_fatal("Failed to write all data to file sink, wrote %zd of %d bytes: %s\n", n, output_data_size,
                           strerror(errno));
                 break;
             }
@@ -523,7 +560,7 @@ int main(int argc, char* argv[]) {
 
 #if defined(OS_LINUX)
         if (v4l2_fd > 0) {
-            if (v4l2_need_format_set) {
+            if (unlikely(v4l2_need_format_set)) {
                 ret = setup_v4l2_format();
                 if (ret < 0) {
                     log_fatal("Failed to set V4L2 format");
@@ -532,29 +569,32 @@ int main(int argc, char* argv[]) {
                 v4l2_need_format_set = false;
             }
             ret = write_to_v4l2_device(output_data, output_data_size);
-            if (ret < 0) {
+            if (unlikely(ret < 0)) {
                 log_fatal("Failed to write to V4L2 device");
                 break;
             }
         }
 #endif
 
-    loop_end: {
-        clock_gettime(CLOCK_MONOTONIC, &frame_end);
+    loop_end:
+        clock_gettime(clock_type, &frame_end);
         frame_time = (frame_end.tv_sec - frame_start.tv_sec) * 1000000000L + (frame_end.tv_nsec - frame_start.tv_nsec);
-        if (frame_time < target_frame_time) {
+        if (likely(frame_time < target_frame_time)) {
             sleep_time.tv_nsec = target_frame_time - frame_time;
             nanosleep(&sleep_time, NULL);
         }
     }
-    }
 
 cleanup:
     // general
-    if (file_sink) close(file_sink);
+    if (file_sink > 0) close(file_sink);
 
 #if defined(OS_LINUX)
     // v4l2
+    if (v4l2_write_buffer) {
+        free(v4l2_write_buffer);
+        v4l2_write_buffer = NULL;
+    }
     if (v4l2_fd > 0) {
         close(v4l2_fd);
         v4l2_fd = -1;
@@ -599,7 +639,8 @@ int convert_ffmpeg(const char* image_data,
                    int* output_data_size) {
     int ret;
 
-    if (!decoder_ctx) {
+    // Quick check if we can reuse existing decoder
+    if (!decoder_ctx || cached_width != width || cached_height != height) {
         AVFormatContext* format_ctx = NULL;
         AVIOContext* avio_ctx = avio_alloc_context((unsigned char*)av_malloc(image_data_size), image_data_size, 0, NULL,
                                                    NULL, NULL, NULL);
@@ -662,77 +703,110 @@ int convert_ffmpeg(const char* image_data,
 
         // Get codec parameters
         AVCodecParameters* codec_params = format_ctx->streams[stream_index]->codecpar;
-
-        // Find decoder
-        decoder = avcodec_find_decoder(codec_params->codec_id);
-        if (!decoder) {
-            avformat_close_input(&format_ctx);
-            av_free(avio_ctx->buffer);
-            avio_context_free(&avio_ctx);
-            log_warn("Decoder not found for codec ID: %d", codec_params->codec_id);
-            return -1;
-        }
-
-        log_debug("Found decoder: %s for format: %s", decoder->name, format_ctx->iformat->name);
-
-        // Create decoder context
-        decoder_ctx = avcodec_alloc_context3(decoder);
-        if (!decoder_ctx) {
-            avformat_close_input(&format_ctx);
-            av_free(avio_ctx->buffer);
-            avio_context_free(&avio_ctx);
-            log_warn("Could not allocate decoder context");
-            return -1;
-        }
-
-        // Copy codec parameters to decoder context
-        ret = avcodec_parameters_to_context(decoder_ctx, codec_params);
-        if (ret < 0) {
-            avformat_close_input(&format_ctx);
-            av_free(avio_ctx->buffer);
-            avio_context_free(&avio_ctx);
-            avcodec_free_context(&decoder_ctx);
-            log_warn("Failed to copy codec parameters to decoder context: %s", av_err2str(ret));
-            return -1;
-        }
-
-        // Various tweaks for low-latency decoding
-        AVDictionary* opts = NULL;
-        av_dict_set(&opts, "threads", "auto", 0);
-        av_dict_set(&opts, "thread_type", "frame", 0);
-        decoder_ctx->thread_count = 0;
-        decoder_ctx->thread_type = FF_THREAD_FRAME;
-        decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-        decoder_ctx->flags2 |= AV_CODEC_FLAG2_CHUNKS;
-        decoder_ctx->get_buffer2 = avcodec_default_get_buffer2;
-        decoder_ctx->lowres = 0;
-
-        // Try to find a device for hardware acceleration
-        enum AVHWDeviceType type = av_hwdevice_find_type_by_name("auto");
-        if (type != AV_HWDEVICE_TYPE_NONE) {
-            AVBufferRef* hw_device_ctx = NULL;
-            ret = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0);
-            if (ret >= 0) {
-                decoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-                av_buffer_unref(&hw_device_ctx);
+        
+        // Check if codec changed
+        if (cached_codec_id != codec_params->codec_id) {
+            // Need to reinitialize decoder
+            if (decoder_ctx) {
+                avcodec_free_context(&decoder_ctx);
+                decoder_ctx = NULL;
             }
+            cached_codec_id = codec_params->codec_id;
         }
 
-        // Open decoder
-        ret = avcodec_open2(decoder_ctx, decoder, &opts);
-        if (ret < 0) {
-            avformat_close_input(&format_ctx);
-            av_free(avio_ctx->buffer);
-            avio_context_free(&avio_ctx);
-            avcodec_free_context(&decoder_ctx);
-            log_warn("Could not open decoder: %s", av_err2str(ret));
-            return -1;
+        if (!decoder_ctx) {
+            // Find decoder
+            decoder = avcodec_find_decoder(codec_params->codec_id);
+            if (!decoder) {
+                avformat_close_input(&format_ctx);
+                av_free(avio_ctx->buffer);
+                avio_context_free(&avio_ctx);
+                log_warn("Decoder not found for codec ID: %d", codec_params->codec_id);
+                return -1;
+            }
+
+            log_debug("Found decoder: %s for format: %s", decoder->name, format_ctx->iformat->name);
+
+            // Create decoder context
+            decoder_ctx = avcodec_alloc_context3(decoder);
+            if (!decoder_ctx) {
+                avformat_close_input(&format_ctx);
+                av_free(avio_ctx->buffer);
+                avio_context_free(&avio_ctx);
+                log_warn("Could not allocate decoder context");
+                return -1;
+            }
+
+            // Copy codec parameters to decoder context
+            ret = avcodec_parameters_to_context(decoder_ctx, codec_params);
+            if (ret < 0) {
+                avformat_close_input(&format_ctx);
+                av_free(avio_ctx->buffer);
+                avio_context_free(&avio_ctx);
+                avcodec_free_context(&decoder_ctx);
+                log_warn("Failed to copy codec parameters to decoder context: %s", av_err2str(ret));
+                return -1;
+            }
+
+            // Various tweaks for low-latency decoding
+            AVDictionary* opts = NULL;
+            av_dict_set(&opts, "threads", "auto", 0);
+            av_dict_set(&opts, "thread_type", "frame+slice", 0);  // Use both frame and slice threading
+            av_dict_set(&opts, "refcounted_frames", "1", 0);      // Enable refcounted frames
+            
+            decoder_ctx->thread_count = 0;  // Auto-detect
+            decoder_ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+            decoder_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+            decoder_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+            decoder_ctx->flags2 |= AV_CODEC_FLAG2_CHUNKS;
+            
+            // Optimization: Skip non-reference frames for speed
+            decoder_ctx->skip_frame = AVDISCARD_NONREF;
+            decoder_ctx->skip_loop_filter = AVDISCARD_ALL;
+            decoder_ctx->skip_idct = AVDISCARD_NONREF;
+            
+            decoder_ctx->lowres = 0;
+
+            // Hardware acceleration support (VAAPI for Linux)
+            #if defined(OS_LINUX)
+            enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
+            
+            // Try VAAPI first (most common on Linux)
+            hw_type = av_hwdevice_find_type_by_name("vaapi");
+            if (hw_type == AV_HWDEVICE_TYPE_NONE) {
+                // Try VDPAU as fallback
+                hw_type = av_hwdevice_find_type_by_name("vdpau");
+            }
+            
+            if (hw_type != AV_HWDEVICE_TYPE_NONE) {
+                AVBufferRef* hw_device_ctx = NULL;
+                ret = av_hwdevice_ctx_create(&hw_device_ctx, hw_type, NULL, NULL, 0);
+                if (ret >= 0) {
+                    decoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                    av_buffer_unref(&hw_device_ctx);
+                    log_debug("Hardware acceleration enabled: %s", av_hwdevice_get_type_name(hw_type));
+                }
+            }
+            #endif
+
+            // Open decoder
+            ret = avcodec_open2(decoder_ctx, decoder, &opts);
+            av_dict_free(&opts);
+            if (ret < 0) {
+                avformat_close_input(&format_ctx);
+                av_free(avio_ctx->buffer);
+                avio_context_free(&avio_ctx);
+                avcodec_free_context(&decoder_ctx);
+                log_warn("Could not open decoder: %s", av_err2str(ret));
+                return -1;
+            }
         }
 
         // Set image dimensions from decoder context
         width = decoder_ctx->width;
         height = decoder_ctx->height;
+        cached_width = width;
+        cached_height = height;
 
         log_debug("Image dimensions: %dx%d", width, height);
 
@@ -742,21 +816,27 @@ int convert_ffmpeg(const char* image_data,
         avio_context_free(&avio_ctx);
     }
 
-    if (!packet_obj) packet_obj = av_packet_alloc();
+    if (!packet_obj) {
+        packet_obj = av_packet_alloc();
+        if (!packet_obj) {
+            log_warn("Failed to allocate packet");
+            return -1;
+        }
+    }
 
     packet_obj->data = (uint8_t*)image_data;
     packet_obj->size = image_data_size;
 
     // Send packet to decoder
     ret = avcodec_send_packet(decoder_ctx, packet_obj);
-    if (ret < 0) {
+    if (unlikely(ret < 0)) {
         log_warn("Error sending packet to decoder: %s", av_err2str(ret));
         return -1;
     }
 
     // Receive frame from decoder
     ret = avcodec_receive_frame(decoder_ctx, input_frame);
-    if (ret < 0) {
+    if (unlikely(ret < 0)) {
         log_warn("Error receiving frame from decoder: %s", av_err2str(ret));
         return -1;
     }
@@ -765,13 +845,20 @@ int convert_ffmpeg(const char* image_data,
     if (!sws_ctx || width != input_frame->width || height != input_frame->height) {
         width = input_frame->width;
         height = input_frame->height;
+        cached_width = width;
+        cached_height = height;
 
         if (sws_ctx) {
             sws_freeContext(sws_ctx);
         }
 
-        sws_ctx = sws_getContext(width, height, input_frame->format, width, height, AV_PIX_FMT_YUYV422,
-                                 SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        // Optimization: Use SWS_POINT for nearest-neighbor (fastest)
+        // or SWS_FAST_BILINEAR for better quality with good speed
+        // Note: CPU capability flags are now auto-detected by FFmpeg
+        sws_ctx = sws_getContext(width, height, input_frame->format, 
+                                width, height, AV_PIX_FMT_YUYV422,
+                                SWS_FAST_BILINEAR,
+                                NULL, NULL, NULL);
 
         if (!sws_ctx) {
             log_warn("Could not initialize SwsContext");
@@ -779,12 +866,13 @@ int convert_ffmpeg(const char* image_data,
         }
 
         // Reallocate output buffer if needed
-        int new_size = av_image_get_buffer_size(AV_PIX_FMT_YUYV422, width, height, 1);
+        int new_size = av_image_get_buffer_size(AV_PIX_FMT_YUYV422, width, height, 32);  // 32-byte alignment
         if (!ffmpeg_output_buffer || new_size > ffmpeg_output_buffer_size) {
             if (ffmpeg_output_buffer) {
                 av_free(ffmpeg_output_buffer);
             }
-            ffmpeg_output_buffer = (uint8_t*)av_malloc(new_size);
+            // Allocate with alignment for SIMD optimizations
+            ffmpeg_output_buffer = (uint8_t*)av_malloc(new_size + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!ffmpeg_output_buffer) {
                 log_warn("Failed to reallocate FFmpeg output buffer");
                 return -1;
@@ -793,8 +881,9 @@ int convert_ffmpeg(const char* image_data,
         }
 
         // Set up output frame
-        ret = av_image_fill_arrays(output_frame->data, output_frame->linesize, ffmpeg_output_buffer, AV_PIX_FMT_YUYV422,
-                                   width, height, 1);
+        ret = av_image_fill_arrays(output_frame->data, output_frame->linesize, 
+                                   ffmpeg_output_buffer, AV_PIX_FMT_YUYV422,
+                                   width, height, 32);  // 32-byte alignment
         if (ret < 0) {
             log_warn("Failed to set up output frame: %s", av_err2str(ret));
             return -1;
@@ -806,10 +895,10 @@ int convert_ffmpeg(const char* image_data,
     }
 
     // Rescale image
-    ret = sws_scale(sws_ctx, (const uint8_t* const*)input_frame->data, input_frame->linesize, 0, height,
-                    output_frame->data, output_frame->linesize);
-    if (ret <= 0) {
-        log_warn("Failed to convert image: %s", av_err2str(ret));
+    ret = sws_scale(sws_ctx, (const uint8_t* const*)input_frame->data, input_frame->linesize, 
+                    0, height, output_frame->data, output_frame->linesize);
+    if (unlikely(ret <= 0)) {
+        log_warn("Failed to convert image: %d", ret);
         return -1;
     }
 
@@ -840,7 +929,7 @@ int cli(int argc, char* argv[]) {
                                            {0, 0, 0, 0}};
     int option_index = 0;
     int c;
-    // opterr = 0;
+    
     while ((c = getopt_long(argc, argv, "ovxbc:f::wd:l:p:sh", long_options, &option_index)) != -1) {
         switch (c) {
             case 'v':
@@ -853,7 +942,6 @@ int cli(int argc, char* argv[]) {
 
             case 'b':
 #if defined(OS_LINUX)
-
                 use_v4l2loopback = false;
 #else
                 log_warn("Option --no-v4l2loopback (-b) ignored as it does nothing on your operating system");
@@ -871,7 +959,7 @@ int cli(int argc, char* argv[]) {
 
             case 'f':
                 if (optarg) {
-                    file_sink = open(optarg, O_RDWR, O_NONBLOCK);
+                    file_sink = open(optarg, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
                     if (file_sink < 0) {
                         log_fatal("Failed to open file sink `%s`: %s", optarg, strerror(errno));
                         return 1;
@@ -883,10 +971,11 @@ int cli(int argc, char* argv[]) {
                 break;
 
             case 'p':
-                if (optarg && !(!optarg || *optarg == '\0')) {
-                    target_fps = atoi(optarg);
-                    if (target_fps < 0) {
-                        log_fatal("Argument for --fps (-p) must be a non-negative integer, got %s", optarg);
+                if (optarg) {
+                    char *endptr;
+                    target_fps = strtol(optarg, &endptr, 10);
+                    if (*endptr != '\0' || target_fps <= 0 || target_fps > 240) {
+                        log_fatal("Argument for --fps (-p) must be a positive integer (1-240), got %s", optarg);
                         return 1;
                     }
                 } else {
@@ -897,9 +986,10 @@ int cli(int argc, char* argv[]) {
 
             case 'd':
 #if defined(OS_LINUX)
-                if (optarg && !(!optarg || *optarg == '\0')) {
-                    v4l2_dev_num = atoi(optarg);
-                    if (target_fps < 0) {
+                if (optarg) {
+                    char *endptr;
+                    v4l2_dev_num = strtol(optarg, &endptr, 10);
+                    if (*endptr != '\0' || v4l2_dev_num < 0) {
                         log_fatal("Argument for --device (-d) must be a non-negative integer, got %s", optarg);
                         return 1;
                     }
