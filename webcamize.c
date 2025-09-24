@@ -1,4 +1,4 @@
-#define VERSION "2.0.1"
+#define VERSION "2.0.2"
 #define LICENSE "BSD-2-Clause"
 #define AUTHOR "W. Turner Abney"
 #define YEAR "2025"
