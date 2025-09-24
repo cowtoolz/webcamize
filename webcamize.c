@@ -899,7 +899,7 @@ int cli(int argc, char* argv[]) {
 #if defined(OS_LINUX)
                 if (optarg && !(!optarg || *optarg == '\0')) {
                     v4l2_dev_num = atoi(optarg);
-                    if (target_fps < 0) {
+                    if (v4l2_dev_num < 0) {
                         log_fatal("Argument for --device (-d) must be a non-negative integer, got %s", optarg);
                         return 1;
                     }
