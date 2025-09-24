@@ -512,7 +512,7 @@ int main(int argc, char* argv[]) {
             output_data_size = image_data_size;
         }
 
-        if (file_sink != -1) {
+        if (file_sink >= 0) {
             int n = write(file_sink, output_data, output_data_size);
             if (n != output_data_size) {
                 ret = errno;
@@ -553,7 +553,7 @@ int main(int argc, char* argv[]) {
 
 cleanup:
     // general
-    if (file_sink) close(file_sink);
+    if (file_sink < 0) close(file_sink);
 
 #if defined(OS_LINUX)
     // v4l2
