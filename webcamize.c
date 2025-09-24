@@ -744,10 +744,16 @@ int convert_ffmpeg(const char* image_data,
         avio_context_free(&avio_ctx);
     }
 
-    if (!packet_obj) packet_obj = av_packet_alloc();
+    if (!packet_obj) {
+        packet_obj = av_packet_alloc();
+    }
 
-    packet_obj->data = (uint8_t*)image_data;
-    packet_obj->size = image_data_size;
+    // Place the image data into the packet
+    ret = av_new_packet(packet_obj, image_data_size);
+    if (ret < 0) {
+        log_warn("Error creating new packet: %s", av_err2str(ret));
+    }
+    memcpy(packet_obj->data, image_data, image_data_size);
 
     // Send packet to decoder
     ret = avcodec_send_packet(decoder_ctx, packet_obj);
@@ -755,6 +761,9 @@ int convert_ffmpeg(const char* image_data,
         log_warn("Error sending packet to decoder: %s", av_err2str(ret));
         return -1;
     }
+
+    // Reset packet
+    av_packet_unref(packet_obj);
 
     // Receive frame from decoder
     ret = avcodec_receive_frame(decoder_ctx, input_frame);
