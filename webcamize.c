@@ -119,13 +119,15 @@ int init_v4l2_device(void) {
 
             kmod_module_unref(mod);
             kmod_unref(kmod_context);
+
+            // retry opening the v4l2loopback control device
+            v4l2loopback_fd = open("/dev/v4l2loopback", 0);
+            if (v4l2loopback_fd < 0) {
+                log_warn("Failed to open v4l2loopback control device: %s", strerror(errno));
+                return -1;
+            }
         }
 
-        v4l2loopback_fd = open("/dev/v4l2loopback", 0);
-        if (v4l2loopback_fd < 0) {
-            log_warn("Failed to open v4l2loopback control device: %s", strerror(errno));
-            return -1;
-        }
         struct v4l2_loopback_config cfg = {0};
         cfg.announce_all_caps = false;
         cfg.output_nr = (int32_t)v4l2_dev_num;
