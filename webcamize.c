@@ -975,7 +975,7 @@ void print_status() {
     printf(COPYRIGHT_LINE);
     printf("\n");
     printf("Libraries:\n");
-    printf("   libgphoto2: %s\n", *(char**)gp_library_version(GP_VERSION_VERBOSE));
+    printf("   libgphoto2: %s\n", *gp_library_version(GP_VERSION_VERBOSE));
     printf("    libavutil: %d.%d.%d\n", LIBAVUTIL_VERSION_MAJOR, LIBAVUTIL_VERSION_MINOR, LIBAVUTIL_VERSION_MICRO);
     printf("   libavcodec: %d.%d.%d\n", LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR, LIBAVCODEC_VERSION_MICRO);
     printf("  libavformat: %d.%d.%d\n", LIBAVFORMAT_VERSION_MAJOR, LIBAVFORMAT_VERSION_MINOR,
