@@ -2,7 +2,7 @@
 Language: Cpp
 BasedOnStyle: Chromium
 IndentWidth: 4
-ColumnLimit: 120
+ColumnLimit: 96
 BreakStringLiterals: false
 SortIncludes: true
 AllowShortFunctionsOnASingleLine: true
